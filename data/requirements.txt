@@ -1,4 +1,1 @@
-Java
-Spring boot
-Angular
-Azure
+Java, Spring boot, docker, Rest Api, Angular

@@ -225,6 +225,25 @@ def main():
         
         logger.info("\nJob Application Screening completed successfully!")
         
+        # Offer to filter candidates
+        if successful > 0:
+            print("\n" + "="*80)
+            print("CANDIDATE FILTERING")
+            print("="*80)
+            try:
+                response = input("\nWould you like to filter candidates by fit score? (y/n): ").strip().lower()
+                if response in ['y', 'yes']:
+                    threshold = input("Enter minimum fit score threshold (default 70): ").strip()
+                    threshold = float(threshold) if threshold else 70.0
+                    
+                    print(f"\nFiltering candidates with fit score >= {threshold}%...")
+                    from filter_candidates import filter_candidates
+                    filter_candidates(str(output_csv), threshold=threshold)
+            except KeyboardInterrupt:
+                print("\n\nFiltering skipped.")
+            except Exception as e:
+                logger.warning(f"Error during filtering: {e}")
+        
     except Exception as e:
         logger.error(f"Fatal error during screening process: {str(e)}", exc_info=True)
         raise

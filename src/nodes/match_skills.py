@@ -5,6 +5,9 @@ from pathlib import Path
 from typing import Dict, List, Set
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
+import sys
+sys.path.append(str(Path(__file__).parent.parent))
+from utils.requirements_parser import RequirementsParser
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -13,9 +16,10 @@ logger = logging.getLogger(__name__)
 
 class SkillMatcher:
     
-    def __init__(self, model_name: str = "gpt-4o", temperature: float = 0.0):
-   
+    def __init__(self, model_name: str = "gpt-4o-mini", temperature: float = 0.0):
+        """Initialize with faster, cheaper model for matching."""
         self.llm = ChatOpenAI(model_name=model_name, temperature=temperature)
+        self._match_cache = {}  # Cache for skill matching results
         self.prompt_template = ChatPromptTemplate.from_messages([
             ("system", """You are an expert HR assistant specialized in matching skills.
 Given a list of required skills and a list of candidate skills, determine:
@@ -23,49 +27,61 @@ Given a list of required skills and a list of candidate skills, determine:
 2. Which required skills are missing
 
 IMPORTANT RULES:
-- ONLY return required skills in the MATCHED list, never return candidate skills that aren't required
-- A required skill can only be marked as MATCHED if the candidate has that skill or a clear synonym/variant
-- If a required skill has no match in the candidate's skills, it must be in MISSING
+- ONLY return required skills in the MATCHED/MISSING lists
+- Use the EXACT skill names from the required list
+- A required skill is MATCHED if the candidate has that skill or a clear synonym/variant
+- If a required skill has no match, it must be in MISSING
+- Every required skill must appear in either MATCHED or MISSING
 
-Consider these equivalences (and similar patterns):
-- "python" matches "python programming", "python3", "python 2.7", etc.
-- "javascript" matches "js", "ecmascript", but also "node.js", "react", "angular", "vue" (frameworks imply the language)
-- "java" matches "java programming", "java 8", "java ee", "spring" (framework implies language)
-- "ruby" matches "ruby programming", "ruby on rails", "rails" (framework implies language)
-- "machine learning" matches "ml", "deep learning", "neural networks", "tensorflow", "pytorch"
-- "sql" matches "mysql", "postgresql", "database", "rdbms", "t-sql"
+Consider these equivalences:
+- "python" matches "python programming", "python3", "django", "flask"
+- "javascript" matches "js", "node.js", "react", "angular", "vue"
+- "java" matches "java programming", "spring", "spring boot", "hibernate"
+- "sql" matches "mysql", "postgresql", "database", "rdbms"
 - "aws" matches "amazon web services", "ec2", "s3", "lambda"
 - "git" matches "github", "gitlab", "version control"
 - "docker" matches "containerization", "kubernetes"
 - "rest api" matches "restful", "api development", "web services"
 
-Return your response in the following format:
-MATCHED: [comma-separated list of ONLY the required skills that the candidate has - use the exact required skill names]
-MISSING: [comma-separated list of ONLY the required skills that the candidate lacks - use the exact required skill names]
+RESPONSE FORMAT (strict):
+MATCHED: skill1, skill2, skill3
+MISSING: skill4, skill5, skill6
 
-Be reasonable in matching - if a candidate has a clear synonym or related framework, consider it a match. But NEVER return skills that aren't in the required list in the MATCHED section.
+Example:
+Required: java, spring boot, mysql, docker, git
+Candidate: python, spring framework, postgresql, github, aws
+
+Response:
+MATCHED: spring boot, git
+MISSING: java, mysql, docker
+
+Use EXACT skill names from required list. No brackets, no extra text.
 """),
             ("user", """Required skills: {required_skills}
 Candidate skills: {candidate_skills}""")
         ])
     
     def read_requirements(self, requirements_path: Path) -> List[str]:
+        """
+        Read and parse requirements file using intelligent parser.
+        Handles both simple lists and full job descriptions.
+        """
         try:
-            with open(requirements_path, 'r', encoding='utf-8') as f:
-                content = f.read()
+            parser = RequirementsParser()
+            result = parser.parse_requirements(requirements_path)
             
-            # Extract skills - assume they are comma-separated or line-separated
-            skills = []
+            skills = result["required_skills"]
             
-            # Try comma-separated first
-            if ',' in content:
-                skills = [s.strip().lower() for s in content.split(',') if s.strip()]
-            else:
-                # Try line-separated
-                skills = [line.strip().lower() for line in content.split('\n') 
-                         if line.strip() and not line.strip().startswith('#')]
+            if not skills:
+                logger.warning("No skills extracted from requirements file")
+                return []
             
-            logger.info(f"Loaded {len(skills)} required skills from {requirements_path.name}")
+            logger.info(f"Extracted {len(skills)} required skills from {requirements_path.name}")
+            logger.info(f"Format detected: {result['format']}")
+            
+            # Log the skills for verification
+            logger.info(f"Required skills: {', '.join(skills[:10])}{'...' if len(skills) > 10 else ''}")
+            
             return skills
             
         except Exception as e:
@@ -127,7 +143,7 @@ Candidate skills: {candidate_skills}""")
     def match_candidate_skills(self, required_skills: List[str], 
                               candidate_skills: List[str]) -> Dict[str, List[str]]:
         """
-        Match candidate skills against required skills.
+        Match candidate skills against required skills with caching.
         
         Args:
             required_skills: List of required skills
@@ -144,6 +160,17 @@ Candidate skills: {candidate_skills}""")
             logger.warning("Candidate has no skills")
             return {"matched": [], "missing": required_skills}
         
+        # Create cache key
+        cache_key = (
+            tuple(sorted(required_skills)),
+            tuple(sorted(candidate_skills))
+        )
+        
+        # Check cache
+        if cache_key in self._match_cache:
+            logger.debug("Using cached matching result")
+            return self._match_cache[cache_key]
+        
         try:
             # Use LLM to intelligently match skills
             chain = self.prompt_template | self.llm
@@ -155,12 +182,17 @@ Candidate skills: {candidate_skills}""")
             # Parse the response with validation
             matching_result = self.parse_matching_response(response.content, required_skills)
             
+            # Cache the result
+            self._match_cache[cache_key] = matching_result
+            
             return matching_result
             
         except Exception as e:
             logger.error(f"Error matching skills: {str(e)}")
             # Fallback to simple exact matching
-            return self.simple_match(required_skills, candidate_skills)
+            result = self.simple_match(required_skills, candidate_skills)
+            self._match_cache[cache_key] = result
+            return result
     
     def simple_match(self, required_skills: List[str], 
                     candidate_skills: List[str]) -> Dict[str, List[str]]:

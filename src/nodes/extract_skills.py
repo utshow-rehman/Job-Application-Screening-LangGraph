@@ -1,6 +1,7 @@
 import logging
 from pathlib import Path
 from typing import Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import pdfplumber
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
@@ -11,8 +12,8 @@ logger = logging.getLogger(__name__)
 
 
 class SkillExtractor:
-    def __init__(self, model_name: str = "gpt-4o", temperature: float = 0.0):
-
+    def __init__(self, model_name: str = "gpt-4o-mini", temperature: float = 0.0):
+        """Initialize with faster, cheaper model for extraction."""
         self.llm = ChatOpenAI(model_name=model_name, temperature=temperature)
         self.prompt_template = ChatPromptTemplate.from_messages([
             ("system", """You are an expert HR assistant specialized in parsing resumes.
@@ -138,7 +139,7 @@ SKILLS: none
 
 def extract_skills_node(state: Dict) -> Dict:
     """
-    LangGraph node function to extract skills from all resumes.
+    LangGraph node function to extract skills from all resumes with parallel processing.
     
     Args:
         state: Graph state containing 'resume_dir' key
@@ -169,17 +170,51 @@ def extract_skills_node(state: Dict) -> Dict:
     
     logger.info(f"Found {len(pdf_files)} resume(s) to process")
     
-    # Extract skills from each resume
+    # Extract skills from each resume in parallel
     extractor = SkillExtractor()
     candidates = []
     errors = []
     
-    for pdf_file in pdf_files:
-        result = extractor.extract_skills_from_resume(pdf_file)
+    # Use parallel processing for faster extraction
+    max_workers = min(5, len(pdf_files))  # Max 5 concurrent API calls
+    
+    if len(pdf_files) == 1:
+        # No need for parallel processing with single file
+        result = extractor.extract_skills_from_resume(pdf_files[0])
         candidates.append(result)
-        
         if result.get("error"):
             errors.append(f"{result['file']}: {result['error']}")
+    else:
+        logger.info(f"Using parallel processing with {max_workers} workers")
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks
+            future_to_file = {
+                executor.submit(extractor.extract_skills_from_resume, pdf_file): pdf_file
+                for pdf_file in pdf_files
+            }
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_file):
+                pdf_file = future_to_file[future]
+                try:
+                    result = future.result()
+                    candidates.append(result)
+                    
+                    if result.get("error"):
+                        errors.append(f"{result['file']}: {result['error']}")
+                except Exception as e:
+                    error_msg = f"Unexpected error processing {pdf_file.name}: {str(e)}"
+                    logger.error(error_msg)
+                    errors.append(error_msg)
+                    candidates.append({
+                        "file": pdf_file.name,
+                        "name": "Unknown",
+                        "skills": [],
+                        "error": str(e)
+                    })
+    
+    # Sort candidates by filename for consistent output
+    candidates.sort(key=lambda x: x.get("file", ""))
     
     return {
         **state,
